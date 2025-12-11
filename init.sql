@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS prices (
+  id INTEGER PRIMARY KEY,
+  created_at DATE NOT NULL,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  price FLOAT NOT NULL
+);
