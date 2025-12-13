@@ -20,6 +20,6 @@ func Connect() (*sql.DB, error) {
 	dbName := os.Getenv("POSTGRES_DB")
 
 	urlString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", dbUser, dbPassword, dbHost, dbPort, dbName)
-	fmt.Println(urlString)
+
 	return sql.Open("postgres", urlString)
 }
