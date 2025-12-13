@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS prices (
-  id INTEGER PRIMARY KEY,
-  created_at DATE NOT NULL,
-  name TEXT NOT NULL,
-  category TEXT NOT NULL,
-  price FLOAT NOT NULL
-);
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    category VARCHAR(255) NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    create_date TIMESTAMP NOT NULL
+)

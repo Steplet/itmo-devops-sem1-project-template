@@ -13,6 +13,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer dataBase.Close()
 
 	http.HandleFunc("POST /api/v0/prices", handlers.PostPrice(dataBase))
 	http.HandleFunc("GET /api/v0/prices", handlers.GetPrice(dataBase))

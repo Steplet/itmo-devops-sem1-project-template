@@ -2,13 +2,13 @@ package handlers
 
 import (
 	"archive/zip"
+	"bytes"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 
@@ -18,21 +18,17 @@ import (
 func PostPrice(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		tmpFile, err := createAndCopyTempFile(r.Body)
-
+		rawData, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, fmt.Errorf("create and copy: %w", err).Error(), http.StatusBadRequest)
+			http.Error(w, fmt.Errorf("read body: %w", err).Error(), http.StatusBadRequest)
 			return
 		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
 
-		zr, err := zip.OpenReader(tmpFile.Name())
+		zr, err := zip.NewReader(bytes.NewReader(rawData), int64(len(rawData)))
 		if err != nil {
-			http.Error(w, fmt.Errorf("open zip reader: %w", err).Error(), http.StatusBadRequest)
+			http.Error(w, fmt.Errorf("open new zip reader: %w", err).Error(), http.StatusBadRequest)
 			return
 		}
-		defer zr.Close()
 
 		for _, f := range zr.File {
 			fileNames := strings.Split(f.Name, "/")
@@ -57,7 +53,11 @@ func PostPrice(db *sql.DB) http.HandlerFunc {
 				http.Error(w, fmt.Errorf("read first line: %w", err).Error(), http.StatusBadRequest)
 				return
 			}
-			data, err := insertData(reader, db)
+			arrayOfData, err := readData(reader)
+			if err != nil {
+				http.Error(w, fmt.Errorf("read data: %w", err).Error(), http.StatusBadRequest)
+			}
+			data, err := insertData(db, arrayOfData)
 			if err != nil {
 				http.Error(w, fmt.Errorf("insert data in db: %w", err).Error(), http.StatusBadRequest)
 				return
@@ -79,135 +79,156 @@ func PostPrice(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func createAndCopyTempFile(requestBody io.ReadCloser) (*os.File, error) {
-	tmpFile, err := os.CreateTemp("", "upload-*.zip")
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = io.Copy(tmpFile, requestBody)
-	if err != nil {
-		return nil, err
-	}
-	tmpFile.Seek(0, 0)
-
-	return tmpFile, nil
-}
-
-func insertData(reader *csv.Reader, db *sql.DB) (*ResponseStats, error) {
-	var totalItems int
-	var categoriesSet = make(map[string]bool)
-	var totalPrice float64
-
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-
+func readData(reader *csv.Reader) (*[]PriceRecord, error) {
+	var records []PriceRecord
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read row: %w", err)
 		}
 
-		id, err := strconv.ParseInt(row[0], 10, 64)
+		record, err := parseAndValidateRow(row)
 		if err != nil {
-			return nil, fmt.Errorf("pars int: %w", err)
+			return nil, fmt.Errorf("parse row: %w", err)
 		}
+		records = append(records, record)
+	}
 
-		price, err := strconv.ParseFloat(row[3], 64)
+	return &records, nil
+}
+
+func parseAndValidateRow(row []string) (PriceRecord, error) {
+	if len(row) < 5 {
+		return PriceRecord{}, fmt.Errorf("invalid row length: %d", len(row))
+	}
+
+	price, err := strconv.ParseFloat(row[3], 64)
+	if err != nil {
+		return PriceRecord{}, fmt.Errorf("invalid price: %w", err)
+	}
+
+	return PriceRecord{
+		Name:      row[1],
+		Category:  row[2],
+		Price:     price,
+		CreatedAt: row[4],
+	}, nil
+}
+
+func insertData(db *sql.DB, records *[]PriceRecord) (*ResponseStats, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer func() {
 		if err != nil {
-			return nil, fmt.Errorf("pars float: %w", err)
+			tx.Rollback()
 		}
+	}()
 
-		name := row[1]
-		category := row[2]
-		createdAt := row[4]
+	query, err := tx.Prepare(`
+		INSERT INTO prices (create_date, name, category, price) 
+		VALUES ($1, $2, $3, $4)
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare statement: %w", err)
+	}
+	defer query.Close()
 
-		categoriesSet[category] = true
-		totalItems++
-		totalPrice += price
-
-		_, err = tx.Exec(
-			`INSERT INTO prices (id, created_at, name, category, price)
-                     VALUES ($1, $2, $3, $4, $5)`,
-			id, createdAt, name, category, price,
+	for _, record := range *records {
+		_, err = query.Exec(
+			record.CreatedAt,
+			record.Name,
+			record.Category,
+			record.Price,
 		)
 		if err != nil {
-			err := tx.Rollback()
-			if err != nil {
-				return nil, fmt.Errorf("rollback transaction: %w", err)
-			}
-			return nil, fmt.Errorf("inserting data: %w", err)
+			return nil, fmt.Errorf("insert record: %w", err)
 		}
 	}
 
-	err = tx.Commit()
+	stats := ResponseStats{}
+
+	err = tx.QueryRow(`
+		SELECT 
+			COUNT(*) as total_items,
+			COALESCE(SUM(price), 0) as total_price,
+			COUNT(DISTINCT category) as total_categories
+		FROM prices
+	`).Scan(&stats.TotalItems, &stats.TotalPrice, &stats.TotalCategories)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("calculate statistics: %w", err)
 	}
 
-	return &ResponseStats{
-		TotalItems:      totalItems,
-		TotalCategories: len(categoriesSet),
-		TotalPrice:      totalPrice,
-	}, nil
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return &stats, nil
 }
 
 func GetPrice(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := db.Query("SELECT id, created_at, name, category, price FROM prices")
+
+		var prices []model.Price
+
+		rows, err := db.Query("SELECT id, create_date, name, category, price FROM prices")
 		if err != nil {
-			http.Error(w, fmt.Errorf("query db: %w", err).Error(), http.StatusBadRequest)
+			http.Error(w, fmt.Errorf("query db: %w", err).Error(), http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
 
-		csvWriter, csvFile, err := getCsvWriter()
-		if err != nil {
-			http.Error(w, fmt.Errorf("csv writer: %w", err).Error(), http.StatusBadRequest)
-			return
-		}
-		defer csvFile.Close()
-
 		for rows.Next() {
-			var p model.Price
-			err := rows.Scan(&p.ID, &p.CreatedAt, &p.Name, &p.Category, &p.Price)
+			var price model.Price
+			err := rows.Scan(&price.ID, &price.CreatedAt, &price.Name, &price.Category, &price.Price)
 			if err != nil {
-				http.Error(w, fmt.Errorf("scan row: %w", err).Error(), http.StatusBadRequest)
+				http.Error(w, fmt.Errorf("scan row: %w", err).Error(), http.StatusInternalServerError)
 				return
 			}
-
-			csvWriter.Write([]string{
-				strconv.FormatInt(p.ID, 10),
-				p.CreatedAt,
-				p.Name,
-				p.Category,
-				strconv.FormatFloat(p.Price, 'f', -1, 64),
-			})
+			prices = append(prices, price)
 		}
+
+		if err := rows.Err(); err != nil {
+			http.Error(w, fmt.Errorf("rows error: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var csvBuffer bytes.Buffer
+		csvWriter := csv.NewWriter(&csvBuffer)
+
+		err = csvWriter.Write([]string{"id", "created_at", "name", "category", "price"})
+		if err != nil {
+			http.Error(w, fmt.Errorf("write csv header: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+
+		for _, price := range prices {
+			err = csvWriter.Write([]string{
+				strconv.FormatInt(price.ID, 10),
+				price.CreatedAt,
+				price.Name,
+				price.Category,
+				strconv.FormatFloat(price.Price, 'f', -1, 64),
+			})
+			if err != nil {
+				http.Error(w, fmt.Errorf("write csv row: %w", err).Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
 		csvWriter.Flush()
 
-		sendZip(csvFile, w)
+		sendZip(csvBuffer.Bytes(), w)
 
 	}
 }
 
-func getCsvWriter() (*csv.Writer, *os.File, error) {
-	csvFile, err := os.CreateTemp("", "data-*.csv")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	csvWriter := csv.NewWriter(csvFile)
-
-	return csvWriter, csvFile, nil
-}
-
-func sendZip(csvFile *os.File, w http.ResponseWriter) {
+func sendZip(csvFile []byte, w http.ResponseWriter) {
 
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"prices.zip\"")
@@ -220,15 +241,10 @@ func sendZip(csvFile *os.File, w http.ResponseWriter) {
 		http.Error(w, fmt.Errorf("create zip output file: %w", err).Error(), http.StatusBadRequest)
 		return
 	}
-	_, err = csvFile.Seek(0, 0)
-	if err != nil {
-		http.Error(w, fmt.Errorf("seek zip output file: %w", err).Error(), http.StatusBadRequest)
-		return
-	}
 
-	_, err = io.Copy(zf, csvFile)
+	_, err = zf.Write(csvFile)
 	if err != nil {
-		http.Error(w, fmt.Errorf("copy zip output file: %w", err).Error(), http.StatusBadRequest)
+		http.Error(w, fmt.Errorf("write output file: %w", err).Error(), http.StatusBadRequest)
 		return
 	}
 
