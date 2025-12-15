@@ -30,47 +30,52 @@ func PostPrice(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
+		var csvFile *zip.File
 		for _, f := range zr.File {
 			fileNames := strings.Split(f.Name, "/")
 			nameCsv := fileNames[len(fileNames)-1]
 
-			if !strings.HasSuffix(nameCsv, ".csv") {
-				continue
+			if strings.HasSuffix(nameCsv, ".csv") {
+				csvFile = f
+				break
 			}
+		}
 
-			rc, err := f.Open()
-			if err != nil {
-				http.Error(w, fmt.Errorf("open file in zip: %w", err).Error(), http.StatusBadRequest)
-				return
-			}
+		if csvFile == nil {
+			http.Error(w, "CSV file not found in archive", http.StatusBadRequest)
+			return
+		}
 
-			reader := csv.NewReader(rc)
+		rc, err := csvFile.Open()
+		if err != nil {
+			http.Error(w, fmt.Errorf("open file in zip: %w", err).Error(), http.StatusBadRequest)
+			return
+		}
 
-			// skip first line
-			_, err = reader.Read()
-			if err != nil {
-				http.Error(w, fmt.Errorf("read first line: %w", err).Error(), http.StatusBadRequest)
-				return
-			}
-			arrayOfData, err := readData(reader)
-			if err != nil {
-				http.Error(w, fmt.Errorf("read data: %w", err).Error(), http.StatusBadRequest)
-			}
-			data, err := insertData(db, arrayOfData)
-			if err != nil {
-				http.Error(w, fmt.Errorf("insert data in db: %w", err).Error(), http.StatusBadRequest)
-				return
-			}
+		defer rc.Close()
 
-			rc.Close()
+		reader := csv.NewReader(rc)
 
-			w.Header().Set("Content-Type", "application/json")
-			err = json.NewEncoder(w).Encode(data)
-			if err != nil {
-				http.Error(w, fmt.Errorf("encode json: %w", err).Error(), http.StatusBadRequest)
-				return
-			}
+		// skip first line
+		_, err = reader.Read()
+		if err != nil {
+			http.Error(w, fmt.Errorf("read first line: %w", err).Error(), http.StatusBadRequest)
+			return
+		}
+		arrayOfData, err := readData(reader)
+		if err != nil {
+			http.Error(w, fmt.Errorf("read data: %w", err).Error(), http.StatusBadRequest)
+		}
+		data, err := insertData(db, arrayOfData)
+		if err != nil {
+			http.Error(w, fmt.Errorf("insert data in db: %w", err).Error(), http.StatusBadRequest)
+			return
+		}
 
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(data)
+		if err != nil {
+			http.Error(w, fmt.Errorf("encode json: %w", err).Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -150,15 +155,14 @@ func insertData(db *sql.DB, records *[]PriceRecord) (*ResponseStats, error) {
 		}
 	}
 
-	stats := ResponseStats{}
+	stats := ResponseStats{TotalItems: len(*records)}
 
 	err = tx.QueryRow(`
 		SELECT 
-			COUNT(*) as total_items,
 			COALESCE(SUM(price), 0) as total_price,
 			COUNT(DISTINCT category) as total_categories
 		FROM prices
-	`).Scan(&stats.TotalItems, &stats.TotalPrice, &stats.TotalCategories)
+	`).Scan(&stats.TotalPrice, &stats.TotalCategories)
 	if err != nil {
 		return nil, fmt.Errorf("calculate statistics: %w", err)
 	}
